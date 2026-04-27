@@ -5,6 +5,8 @@ Based on navilink_decode_logpoint from GPSBabel
 
 This parser reads the SBP (SiRF Binary Protocol) format used by Locosys devices.
 Record size: 32 bytes per logpoint
+
+Human-approved vibecode (Claude Sonnet 4.5)
 """
 
 import struct
@@ -56,11 +58,21 @@ class LogPoint:
 class SBPParser:
     """Parser for Locosys SBP binary format"""
 
-    def __init__(self, filename: str, debug: bool = False):
+    def __init__(self, filename: str, debug: bool = False, tz_offset: int = 0):
         self.filename = filename
         self.debug = debug
+        self.tz_offset = tz_offset
+        if tz_offset == 0:
+            self.tz_offset_postfix = "Z"
+        else:
+            self.tz_offset_postfix = f"{tz_offset:+03d}00"
         self.header: Optional[SBPHeader] = None
         self.records: List[LogPoint] = []
+
+    def _adjusted_ts(self, ts: Optional[datetime]) -> Optional[datetime]:
+        if ts is None or self.tz_offset == 0:
+            return ts
+        return ts + timedelta(hours=self.tz_offset)
 
     def read_file(self) -> Tuple[Optional[SBPHeader], List[LogPoint]]:
         """Read and parse the entire SBP file"""
@@ -362,10 +374,11 @@ class SBPParser:
                 ele.text = f"{point.altitude:.2f}"
 
             # Add time with milliseconds if valid
-            if point.timestamp:
+            ts = self._adjusted_ts(point.timestamp)
+            if ts:
                 time_elem = ET.SubElement(trkpt, 'time')
-                ms = point.timestamp.microsecond // 1000
-                time_elem.text = point.timestamp.strftime(f'%Y-%m-%dT%H:%M:%S.{ms:03d}Z')
+                ms = ts.microsecond // 1000
+                time_elem.text = ts.strftime(f'%Y-%m-%dT%H:%M:%S.{ms:03d}{self.tz_offset_postfix}')
 
             # Satellites as direct child
             if point.satellites > 0:
@@ -450,8 +463,9 @@ class SBPParser:
                 if point.latitude == 0 and point.longitude == 0:
                     continue
 
+                ts = self._adjusted_ts(point.timestamp)
                 writer.writerow([
-                    point.timestamp.strftime('%Y-%m-%d %H:%M:%S') if point.timestamp else '',
+                    ts.strftime('%Y-%m-%d %H:%M:%S') if ts else '',
                     f"{point.latitude:.7f}",
                     f"{point.longitude:.7f}",
                     f"{point.altitude:.1f}" if point.altitude != 0 else '',
@@ -465,10 +479,16 @@ class SBPParser:
 
     def export_to_json(self, output_file: str):
         """Export to JSON"""
+        def point_dict(p):
+            d = p.to_dict()
+            ts = self._adjusted_ts(p.timestamp)
+            d['timestamp'] = ts.isoformat() if ts else None
+            return d
+
         data = {
             'header': self.header.to_dict() if self.header else None,
             'record_count': len(self.records),
-            'records': [p.to_dict() for p in self.records if p.latitude != 0 or p.longitude != 0]
+            'records': [point_dict(p) for p in self.records if p.latitude != 0 or p.longitude != 0]
         }
 
         with open(output_file, 'w', encoding='utf-8') as f:
@@ -557,15 +577,19 @@ def main():
     if len(sys.argv) < 2:
         print("sbp2gpx.py - Locosys NaviGPS GT-31/BGT-31 Binary Datalog File Converter")
         print("Repository: https://github.com/ern0/sbp2gpx/")
-        print("\nUsage: sbp2gpx.py <input_file> [output_file] [--debug]")
+        print("\nUsage: sbp2gpx.py <input_file> [output_file] [-t=<offset>] [--debug]")
         print("\nOutput format is determined by output file extension:")
         print("  .gpx  - GPX format (GPS Exchange Format)")
         print("  .csv  - CSV format (Comma Separated Values)")
         print("  .json - JSON format (JavaScript Object Notation)")
         print("\nIf no output file is specified, prints summary only.")
+        print("\nOptions:")
+        print("  -t=<offset>          Hour offset added to all timestamps (e.g. -t=+2, -t=-1, default: 0)")
+        print("  --timezone=<offset>  Same as -t")
         print("\nExamples:")
         print("  sbp2gpx.py track.sbp                    # Show summary")
         print("  sbp2gpx.py track.sbp track.gpx          # Export to GPX")
+        print("  sbp2gpx.py track.sbp track.gpx -t=+2    # Export with UTC+2 timestamps")
         print("  sbp2gpx.py track.sbp track.csv --debug  # Export to CSV with debug")
         print("  sbp2gpx.py track.sbp track.json         # Export to JSON")
         sys.exit(1)
@@ -579,18 +603,26 @@ def main():
     # Parse arguments
     output_file = None
     debug = False
+    tz_offset = 0
 
     i = 2
     while i < len(sys.argv):
         arg = sys.argv[i].lower()
         if arg == '--debug':
             debug = True
+        elif arg.startswith('-t=') or arg.startswith('--timezone='):
+            val = arg.split('=', 1)[1]
+            try:
+                tz_offset = int(val)
+            except ValueError:
+                print(f"Error: Invalid timezone offset '{val}'")
+                sys.exit(1)
         elif not output_file and not arg.startswith('-'):
             output_file = arg
         i += 1
 
     print(f"Reading {input_file}...")
-    parser = SBPParser(input_file, debug=debug)
+    parser = SBPParser(input_file, debug=debug, tz_offset=tz_offset)
 
     try:
         header, records = parser.read_file()
